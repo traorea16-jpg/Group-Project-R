@@ -1,0 +1,148 @@
+```{r}
+video_id   <- "2hyoyxdTfl4"
+langue_sub <- "fr"
+ytdlp      <- "python -m yt_dlp"   # si ca echoue, mets "py -m yt_dlp"
+max_com    <- 1000    
+```
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(syuzhet)
+library(tidytext)
+```
+
+```{r}
+url <- paste0("https://www.youtube.com/watch?v=", video_id)
+```
+
+```{r}
+system(paste0(ytdlp, ' --list-subs "', url, '"'))
+
+system(paste0(
+  ytdlp, ' --skip-download --write-comments ',
+  '--extractor-args "youtube:max_comments=', max_com, '" ',
+  '--write-auto-subs --write-subs --sub-langs "', langue_sub, '.*" ',
+  '--sub-format vtt -o "video" "', url, '"'
+))
+```
+
+```{r}
+if (!file.exists("video.info.json")) stop("video.info.json introuvable : le telechargement a echoue.")
+
+info <- fromJSON("video.info.json")
+if (is.null(info$comments)) stop("Aucun commentaire recupere (commentaires desactives ou blocage YouTube).")
+
+df_com <- tibble(texte = info$comments$text)
+cat("Nombre de commentaires recuperes :", nrow(df_com), "\n")
+
+```
+
+```{r}
+fichier_vtt <- list.files(pattern = "^video.*\\.vtt$")[1]
+if (is.na(fichier_vtt)) stop("Aucun sous-titre telecharge : regarde la liste affichee par --list-subs ou change de video.")
+cat("Fichier de sous-titres :", fichier_vtt, "\n")
+
+lignes <- readLines(fichier_vtt, encoding = "UTF-8")
+
+texte_sub <- lignes |>
+  str_subset("-->", negate = TRUE) |>
+  str_remove_all("<[^>]+>") |>
+  str_squish()
+
+texte_sub <- texte_sub[texte_sub != "" &
+                       !str_detect(texte_sub, "^(WEBVTT|Kind:|Language:)")]
+```
+
+```{r}
+texte_sub <- texte_sub[c(TRUE, texte_sub[-1] != texte_sub[-length(texte_sub)])]
+
+```
+
+```{r}
+df_sub <- tibble(texte = texte_sub) |>
+  mutate(bloc = (row_number() - 1) %/% 8) |>
+  group_by(bloc) |>
+  summarise(texte = paste(texte, collapse = " "), .groups = "drop") |>
+  select(texte)
+```
+
+```{r}
+nettoyer <- function(x) {
+  x |>
+    str_to_lower() |>
+    str_remove_all("http\\S+") |>
+    str_replace_all("[^\\p{L}\\s]", " ") |>
+    str_squish()
+}
+
+df_all <- bind_rows(
+  df_sub |> mutate(source = "Sous-titres"),
+  df_com |> mutate(source = "Commentaires")
+) |>
+  mutate(texte_clean = nettoyer(texte)) |>
+  filter(texte_clean != "")
+```
+
+```{r}
+df_all <- df_all |>
+  mutate(
+    score = get_sentiment(texte_clean, method = "nrc", lang = "french"),
+    avis  = case_when(score > 0 ~ "positif",
+                      score < 0 ~ "négatif",
+                      TRUE      ~ "neutre")
+  )
+```
+
+```{r}
+resultats <- df_all |>
+  count(source, avis) |>
+  group_by(source) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+print(resultats)
+```
+
+```{r}
+print(df_all |> group_by(source) |> summarise(score_moyen = mean(score)))
+```
+
+```{r}
+g1 <- ggplot(resultats, aes(avis, pct, fill = source)) +
+  geom_col(position = "dodge") +
+  labs(title = "Sentiment : discours vs public",
+       x = NULL, y = "% des textes", fill = "Source") +
+  theme_minimal()
+print(g1)
+```
+
+```{r}
+mots <- df_all |>
+  unnest_tokens(mot, texte_clean) |>
+  filter(!mot %in% stopwords::stopwords("fr"), nchar(mot) > 2)
+
+g2 <- mots |>
+  count(source, mot, sort = TRUE) |>
+  group_by(source) |>
+  slice_head(n = 10) |>
+  ggplot(aes(reorder_within(mot, n, source), n, fill = source)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  coord_flip() +
+  facet_wrap(~source, scales = "free") +
+  labs(title = "Mots les plus fréquents", x = NULL, y = "Fréquence") +
+  theme_minimal()
+print(g2)
+```
+
+```{r}
+df_all |>
+  group_by(source) |>
+  slice_sample(n = 10) |>
+  select(source, texte, score, avis) |>
+  print(n = 20)
+
+write_csv(df_all, "resultats_sentiment.csv")
+cat("Termine. Resultats sauvegardes dans resultats_sentiment.csv\n")
+
+```
+
